@@ -9,7 +9,6 @@ import com.honeywell.aidc.AidcManager
 import com.honeywell.aidc.BarcodeFailureEvent
 import com.honeywell.aidc.BarcodeReadEvent
 import com.honeywell.aidc.BarcodeReader
-import com.honeywell.aidc.ScannerUnavailableException
 
 class HoneywellBarcodeReaderModule(reactContext: ReactApplicationContext) :
     NativeHoneywellSpec(reactContext), BarcodeReader.BarcodeListener {
@@ -26,6 +25,9 @@ class HoneywellBarcodeReaderModule(reactContext: ReactApplicationContext) :
     private var manager: AidcManager? = null
     private var reader: BarcodeReader? = null
     private val mReactContext: ReactApplicationContext = reactContext
+    private val lock = Any()
+    // Bumped on every start/stop so a late AidcManager.create callback knows it is stale
+    private var generation = 0
 
     init {
         // Log that we're using the new architecture
@@ -57,55 +59,85 @@ class HoneywellBarcodeReaderModule(reactContext: ReactApplicationContext) :
     }
 
     override fun startReader(promise: Promise) {
-        AidcManager.create(mReactContext) { aidcManager ->
-            manager = aidcManager
-            reader = manager?.createBarcodeReader()
-            reader?.let { barcodeReader ->
-                try {
-                    barcodeReader.addBarcodeListener(this)
+        // Drop any previous session and invalidate pending create callbacks
+        val gen = synchronized(lock) {
+            releaseReaderLocked()
+            ++generation
+        }
+        try {
+            AidcManager.create(mReactContext) { aidcManager ->
+                synchronized(lock) {
+                    if (gen != generation) {
+                        // stopReader/startReader ran while waiting for the scanner service
+                        closeQuietly { aidcManager.close() }
+                        promise.resolve(false)
+                        return@create
+                    }
+                    manager = aidcManager
+                    try {
+                        // The SDK can throw (e.g. NPE in DcsJsonRpcHelper) when the
+                        // scanner service is not ready; this runs on the main thread
+                        val barcodeReader = aidcManager.createBarcodeReader()
+                        if (barcodeReader == null) {
+                            releaseReaderLocked()
+                            promise.resolve(false)
+                            return@create
+                        }
+                        reader = barcodeReader
+                        barcodeReader.addBarcodeListener(this)
+                        // Configure barcode reader properties using string constants
+                        setReaderPropertyBoolean("DEC_EAN13_ENABLED", true)
+                        setReaderPropertyBoolean("DEC_EAN8_CHECK_DIGIT_TRANSMIT", true)
+                        setReaderPropertyBoolean("DEC_EAN13_CHECK_DIGIT_TRANSMIT", true)
+                        setReaderPropertyBoolean("DEC_UPCA_ENABLE", true)
+                        setReaderPropertyBoolean("DEC_UPCA_CHECK_DIGIT_TRANSMIT", true)
+                        setReaderPropertyBoolean("DEC_UPCE_ENABLE", true)
+                        setReaderPropertyBoolean("DEC_UPCE_CHECK_DIGIT_TRANSMIT", true)
+                        setReaderPropertyBoolean("DEC_CODABAR_ENABLED", true)
+                        setReaderPropertyBoolean("DEC_CODABAR_CHECK_DIGIT_MODE", true)
+                        setReaderPropertyBoolean("DEC_I25_ENABLED", true)
+                        setReaderPropertyBoolean("DEC_I25_CHECK_DIGIT_MODE", true)
 
-                    // Configure barcode reader properties using string constants
-                    setReaderPropertyBoolean("DEC_EAN13_ENABLED", true)
-                    setReaderPropertyBoolean("DEC_EAN8_CHECK_DIGIT_TRANSMIT", true)
-                    setReaderPropertyBoolean("DEC_EAN13_CHECK_DIGIT_TRANSMIT", true)
-                    setReaderPropertyBoolean("DEC_UPCA_ENABLE", true)
-                    setReaderPropertyBoolean("DEC_UPCA_CHECK_DIGIT_TRANSMIT", true)
-                    setReaderPropertyBoolean("DEC_UPCE_ENABLE", true)
-                    setReaderPropertyBoolean("DEC_UPCE_CHECK_DIGIT_TRANSMIT", true)
-                    setReaderPropertyBoolean("DEC_CODABAR_ENABLED", true)
-                    setReaderPropertyBoolean("DEC_CODABAR_CHECK_DIGIT_MODE", true)
-                    setReaderPropertyBoolean("DEC_I25_ENABLED", true)
-                    setReaderPropertyBoolean("DEC_I25_CHECK_DIGIT_MODE", true)
-
-                    barcodeReader.claim()
-                    promise.resolve(true)
-                } catch (e: ScannerUnavailableException) {
-                    promise.resolve(false)
-                    e.printStackTrace()
+                        barcodeReader.claim()
+                        promise.resolve(true)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Failed to start barcode reader", e)
+                        releaseReaderLocked()
+                        promise.resolve(false)
+                    }
                 }
             }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to create AidcManager", e)
+            promise.resolve(false)
         }
     }
 
     override fun stopReader(promise: Promise) {
-        reader?.let { barcodeReader ->
-            try {
-                barcodeReader.release()
-                barcodeReader.close()
-            } catch (e: Exception) {
-                e.printStackTrace()
-            }
+        synchronized(lock) {
+            generation++
+            releaseReaderLocked()
         }
-
-        manager?.let { aidcManager ->
-            try {
-                aidcManager.close()
-            } catch (e: Exception) {
-                e.printStackTrace()
-            }
-        }
-
         promise.resolve(null)
+    }
+
+    private fun releaseReaderLocked() {
+        reader?.let { barcodeReader ->
+            closeQuietly { barcodeReader.removeBarcodeListener(this) }
+            closeQuietly { barcodeReader.release() }
+            closeQuietly { barcodeReader.close() }
+        }
+        reader = null
+        manager?.let { aidcManager -> closeQuietly { aidcManager.close() } }
+        manager = null
+    }
+
+    private inline fun closeQuietly(block: () -> Unit) {
+        try {
+            block()
+        } catch (e: Exception) {
+            if (D) Log.w(TAG, "Error releasing barcode reader: ${e.message}")
+        }
     }
 
     override fun setReaderPropertyString(propName: String, value: String) {
